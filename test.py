@@ -1,7 +1,7 @@
 # test_subregion.py
 from machine import Pin, I2C
 import time
-from ssd1315_72x40 import SSD1315_I2C
+from ssd1315 import SSD1315_I2C
 
 # 初始化 I2C
 i2c = I2C(0, scl=Pin(6), sda=Pin(5), freq=400000)
