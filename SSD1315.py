@@ -1,10 +1,12 @@
-
-
-# ssd1306_subregion.py
-# 针对子区域优化的 SSD1306 I2C 驱动，支持硬件滚动和高效图片显示
+# ssd1306_subregion_driver.py
+# 整合版：SSD1306/SSD1315 I2C 驱动，支持子区域、硬件滚动、图片显示
+# 继承 FrameBuffer，绘图坐标相对于子区域 (0,0)
+# 测试流程涵盖填充、边框、文字、软件滚动和硬件滚动
 
 from micropython import const
 import framebuf
+from machine import Pin, I2C
+import time
 
 # ---------- 寄存器定义 ----------
 SET_CONTRAST        = const(0x81)
@@ -28,7 +30,6 @@ SET_CHARGE_PUMP     = const(0x8d)
 # 滚动命令
 SCROLL_HORIZONTAL_RIGHT = const(0x26)
 SCROLL_HORIZONTAL_LEFT  = const(0x27)
-
 SCROLL_VERTICAL_AND_HORIZONTAL = const(0x29)
 SCROLL_VERTICAL         = const(0x2A)
 SCROLL_ACTIVATE         = const(0x2F)
@@ -38,11 +39,13 @@ SET_VERTICAL_SCROLL_AREA = const(0xA3)
 
 class SSD1315_I2C(framebuf.FrameBuffer):
     """
-    仅维护子区域缓冲区的 SSD1306 I2C 驱动，支持硬件滚动。
+    仅维护子区域缓冲区的 SSD1306/SSD1315 I2C 驱动，支持硬件滚动。
     物理尺寸与子区域分离，绘图坐标相对于子区域左上角 (0,0)。
     """
 
-    def __init__(self, phys_width, phys_height, i2c, addr=0x3c,x_offset=0, y_offset=0, sub_width=None, sub_height=None,external_vcc=False):
+    def __init__(self, phys_width, phys_height, i2c, addr=0x3c,
+                 x_offset=0, y_offset=0, sub_width=None, sub_height=None,
+                 external_vcc=False):
         """
         参数：
             phys_width, phys_height : 物理屏幕分辨率（如 128,64）
@@ -79,23 +82,14 @@ class SSD1315_I2C(framebuf.FrameBuffer):
         """发送单字节命令"""
         self.temp[0] = 0x80
         self.temp[1] = cmd
-
         self.i2c.writeto(self.addr, self.temp)
 
-
-
     def write_cmd_list(self, cmds):
-
         """发送多字节命令序列"""
-
         for c in cmds:
-
             self.write_cmd(c)
 
-
-
     def write_data(self, buf):
-
         """发送数据（带控制字节 0x40）"""
         self.i2c.writeto(self.addr, b'\x40' + buf)
 
@@ -184,15 +178,10 @@ class SSD1315_I2C(framebuf.FrameBuffer):
         # 设置垂直滚动区域
         self.write_cmd(SET_VERTICAL_SCROLL_AREA)
         self.write_cmd(0)                      # 起始行
-
         self.write_cmd(self.phys_height)      # 总行数
-
         # 垂直偏移取低6位，若为负则取其补码表示
-
         offset = vertical_offset & 0x3F
-
         self.write_cmd_list([
-
             SCROLL_VERTICAL, 0x00, start_page, speed, end_page,
             offset
         ])
@@ -211,7 +200,6 @@ class SSD1315_I2C(framebuf.FrameBuffer):
         self.write_cmd(SET_VERTICAL_SCROLL_AREA)
         self.write_cmd(0)
         self.write_cmd(self.phys_height)
-        # 参数格式：命令, 0x00, start_page, speed, end_page, vertical_offset, ...
         self.write_cmd_list([
             SCROLL_VERTICAL_AND_HORIZONTAL, 0x00, start_page, speed, end_page,
             vertical_offset & 0x3F,
@@ -226,55 +214,105 @@ class SSD1315_I2C(framebuf.FrameBuffer):
     # ---------- 高性能图片/汉字显示 ----------
     def newBuffer(self, data, w, h, x=0, y=0, format=framebuf.MONO_VLSB):
         """
-
         直接使用预编码的字节数据显示图片/汉字（最高效）。
-
         data : bytes/bytearray，已按指定格式打包。
-
         w, h : 像素宽度和高度。
-
         x, y : 在子区域内的绘制坐标。
-
         format: 默认为 MONO_VLSB（纵向取模低位在前）。
         """
         fbuf = framebuf.FrameBuffer(data, w, h, format)
         self.blit(fbuf, x, y)
 
-    # （可选）兼容旧二维列表方式，但建议使用一维字节数组
-    def newBuffer_from_2d(self, arr, x=0, y=0):
-        """
-        从二维字节数组（每行为字节列表）转换并显示。
-        效率较低，仅用于兼容旧代码。
-        """
-        if not arr:
-            return
-        # 展平为一维 bytearray
-
-        buf = bytearray()
-
-        for row in arr:
-
-            buf.extend(row)
-
-        # 计算像素尺寸：每行字节数*8，行数*8
-
-        w = len(arr[0]) * 8
-
-        h = len(arr) * 8
-
-        fbuf = framebuf.FrameBuffer(buf, w, h, framebuf.MONO_VLSB)
-        self.blit(fbuf, x, y)
     def set_rotation(self, rotation):
-
         """
-
         设置屏幕旋转/镜像。
-
         rotation: 0 - 正常, 1 - 水平翻转(左右镜像), 2 - 垂直翻转(上下镜像), 3 - 180度翻转
-
         """
-
         seg_remap = 0x00 if rotation in (0, 2) else 0x01  # bit0: 0正常,1重映射
         com_dir = 0x00 if rotation in (0, 1) else 0x08   # bit3: 0正常,1反向
-        self.write_cmd(SET_SEG_REMAP | seg_remap)   # SET_SEG_REMAP 命令低bit控制
-        self.write_cmd(SET_COM_OUT_DIR | com_dir)   # SET_COM_OUT_DIR 命令的bit3控制
+        self.write_cmd(SET_SEG_REMAP | seg_remap)
+        self.write_cmd(SET_COM_OUT_DIR | com_dir)
+
+
+# ========== 测试流程（基于 ssd1306_direct_write.py） ==========
+print("SSD1306 子区域驱动测试")
+
+# ---------- I2C 初始化 ----------
+i2c = I2C(0, scl=Pin(6), sda=Pin(5), freq=400000)
+addr = 0x3c
+if 0x3d in i2c.scan():
+    addr = 0x3d
+print("I2C addr:", hex(addr))
+
+# ---------- 创建显示对象（子区域 72x40，偏移 28,24） ----------
+display = SSD1315_I2C(
+    phys_width=128,
+    phys_height=64,
+    i2c=i2c,
+    addr=addr,
+    x_offset=28,
+    y_offset=24,
+    sub_width=72,
+    sub_height=40,
+    external_vcc=False
+)
+
+# 注意：display 本身就是 FrameBuffer，可以直接调用 fill, rect, text 等
+W, H = display.sub_width, display.sub_height
+
+# ---------- 测试 1：填充白色 ----------
+print("Test 1: Fill area white")
+display.fill(1)
+display.show()
+time.sleep(1)
+
+# ---------- 测试 2：清除 ----------
+print("Test 2: Clear area")
+display.fill(0)
+display.show()
+time.sleep(1)
+
+# ---------- 测试 3：边框和文字 ----------
+print("Test 3: Draw border and text")
+display.fill(0)
+display.rect(0, 0, W, H, 1)          # 边框
+display.text("OLED", 10, 12, 1)
+display.text("Test",  20, 24, 1)
+display.show()
+time.sleep(2)
+
+# ---------- 测试 4：软件滚动文字（模拟移动） ----------
+print("Test 4: Software scrolling text")
+text = "Hello"
+tw = len(text) * 8
+for offset in range(0, W - tw + 1, 2):
+    display.fill(0)
+    display.rect(0, 0, W, H, 1)
+    display.text(text, offset, 16, 1)
+    display.show()
+    time.sleep_ms(50)
+
+# ---------- 测试 5：硬件滚动（水平） ----------
+print("Test 5: Hardware horizontal scroll (right) for 3 seconds")
+display.fill(0)
+display.text("Scroll", 10, 12, 1)
+display.text("Demo", 20, 24, 1)
+display.show()
+time.sleep(0.5)
+# 启动水平滚动（影响所有页，速度适中）
+display.scroll_horizontal(direction='right', start_page=0, end_page=7, speed=4)
+time.sleep(3)
+display.stop_scroll()
+
+print("Test 6: Hardware vertical scroll for 3 seconds")
+display.fill(0)
+display.text("Vertical", 10, 12, 1)
+display.text("Demo", 20, 24, 1)
+display.show()
+time.sleep(0.5)
+# 垂直滚动：向下偏移 16 行，影响所有页
+display.scroll_vertical(direction='down', start_page=0, end_page=7, vertical_offset=16, speed=2)
+time.sleep(3)
+display.stop_scroll()
+
+print("All tests done.")
